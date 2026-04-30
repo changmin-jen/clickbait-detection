@@ -1,63 +1,127 @@
 # Clickbait Detection
 
-This repository contains a clickbait detection experiment based on precomputed
-multimodal embeddings for title text, thumbnail image, speech-to-text segments,
-and keyframe features.
+Multimodal clickbait detection experiments using precomputed embeddings from:
 
-The code is organized into reusable Python modules under `src/` and executable
-experiment entrypoints under `experiments/`.
+- title text
+- thumbnail image
+- speech-to-text segments
+- video keyframes
 
-## Structure
+The project compares sequence pooling strategies and runs modality ablation
+experiments over four modality-pair branches.
+
+## Project Structure
 
 ```text
 clickbait-detection/
-├── src/
-│   ├── __init__.py
-│   ├── data.py
-│   ├── pooling.py
-│   ├── model.py
-│   ├── loss.py
-│   ├── metrics.py
-│   ├── train.py
-│   ├── analysis.py
-│   └── utils.py
-├── experiments/
-│   ├── pooling_experiment.py
-│   └── ablation_experiment.py
-├── results/
-│   ├── figures/
-│   └── tables/
-└── README.md
+|-- experiments/
+|   |-- pooling_experiment.py
+|   `-- ablation_experiment.py
+|-- src/
+|   |-- __init__.py
+|   |-- analysis.py
+|   |-- data.py
+|   |-- loss.py
+|   |-- metrics.py
+|   |-- model.py
+|   |-- pooling.py
+|   |-- train.py
+|   `-- utils.py
+|-- results/
+|   |-- figures/
+|   `-- tables/
+`-- README.md
 ```
 
-## Usage
+## Data Format
 
-Run the pooling comparison experiment:
+The experiment expects a PyTorch `.pt` file with this structure:
+
+```python
+{
+    "samples": [
+        {
+            "id": "...",
+            "split": "train",  # train, valid, or test
+            "label_id": 0,     # 0 or 1
+            "title_emb": Tensor[D],
+            "thumb_emb": Tensor[D],
+            "stt_embs": Tensor[N_stt, D],
+            "kf_embs": Tensor[N_keyframes, D],
+        },
+        ...
+    ]
+}
+```
+
+The default model assumes `D = 768`.
+
+## Experiments
+
+### Pooling Comparison
+
+Compares `mean`, `topk`, `topk_sim`, and `attention` pooling for variable-length
+STT/keyframe embeddings.
 
 ```bash
 python experiments/pooling_experiment.py --pt-path /path/to/embeddings.pt
 ```
 
-Run the modality ablation experiment:
+Run selected pooling methods:
+
+```bash
+python experiments/pooling_experiment.py \
+  --pt-path /path/to/embeddings.pt \
+  --pooling mean attention \
+  --epochs 30 \
+  --batch-size 32
+```
+
+### Modality Ablation
+
+Evaluates which modality-pair branches contribute most to classification.
+
+Branches:
+
+- `tk`: title + keyframe
+- `ts`: title + STT
+- `thk`: thumbnail + keyframe
+- `ths`: thumbnail + STT
+
+Run all ablations:
 
 ```bash
 python experiments/ablation_experiment.py --pt-path /path/to/embeddings.pt
 ```
 
-The embedding `.pt` file is expected to contain a `samples` list with `train`,
-`valid`, and `test` splits.
+Run selected ablations:
 
-## Module Layout
+```bash
+python experiments/ablation_experiment.py \
+  --pt-path /path/to/embeddings.pt \
+  --experiments All "w/o TS" "w/o ThK"
+```
 
-- `src/data.py`: loads the embedding `.pt` file, builds datasets, pads variable
-  length STT/keyframe sequences, and creates dataloaders.
-- `src/pooling.py`: contains mean, top-k, top-k-similarity, and attention pooling
-  layers.
-- `src/model.py`: contains the shared branch-fusion model used by both pooling
-  comparison and modality ablation experiments.
-- `src/loss.py`: contains fused/branch BCE loss helpers.
-- `src/metrics.py`: contains threshold search, prediction collection, and
-  evaluation metrics.
-- `src/train.py`: contains reusable training loops and experiment runners.
-- `src/analysis.py`: contains branch-attention summary/plot utilities.
-- `experiments/`: contains thin command-line entrypoints for each experiment.
+## Source Modules
+
+- `src/data.py`: dataset, padding, collate function, dataloader creation
+- `src/pooling.py`: mean, top-k, top-k similarity, and attention pooling
+- `src/model.py`: shared branch-fusion model for both experiment types
+- `src/loss.py`: branch and fused BCE loss helpers
+- `src/metrics.py`: accuracy, precision, recall, F1, AUC, threshold search
+- `src/train.py`: training loop, early stopping, experiment runners
+- `src/analysis.py`: branch attention summary and plot utilities
+- `src/utils.py`: device selection, batch device movement, seed setup
+
+## Outputs
+
+Pooling experiment checkpoints are saved to `results/models/` by default.
+Figures and tables can be saved under:
+
+- `results/figures/`
+- `results/tables/`
+
+## Notes
+
+The original notebook has been refactored into Python modules so experiments can
+be rerun from the command line and each component can be maintained separately.
