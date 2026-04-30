@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-import torch.nn as nn
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
 
-from .loss import compute_loss
+from .utils import move_batch_to_device
 
 
 def compute_metrics(labels: np.ndarray, probs: np.ndarray, threshold: float = 0.5) -> dict:
     preds = (probs >= threshold).astype(int)
-    acc = accuracy_score(labels, preds)
     precision, recall, f1, _ = precision_recall_fscore_support(
         labels,
         preds,
@@ -24,91 +22,71 @@ def compute_metrics(labels: np.ndarray, probs: np.ndarray, threshold: float = 0.
         auc = 0.0
 
     return {
-        "acc": acc,
+        "auc": auc,
+        "acc": accuracy_score(labels, preds),
+        "f1": f1,
         "precision": precision,
         "recall": recall,
-        "f1": f1,
-        "auc": auc,
     }
 
 
 def search_best_threshold(labels: np.ndarray, probs: np.ndarray, metric: str = "f1"):
-    best_thr = 0.5
-    best_score = -1
+    best_threshold = 0.5
+    best_score = -1.0
     best_metrics = None
 
-    for thr in np.arange(0.1, 0.91, 0.01):
-        metrics = compute_metrics(labels, probs, threshold=thr)
-        score = metrics[metric]
-        if score > best_score:
-            best_score = score
-            best_thr = thr
+    for threshold in np.arange(0.1, 0.91, 0.01):
+        metrics = compute_metrics(labels, probs, threshold=threshold)
+        if metrics[metric] > best_score:
+            best_threshold = threshold
+            best_score = metrics[metric]
             best_metrics = metrics
 
-    return best_thr, best_metrics
+    return best_threshold, best_metrics
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion=None, threshold: float = 0.5, device: str | torch.device | None = None):
+def collect_predictions(model, loader, device: str | torch.device) -> tuple[np.ndarray, np.ndarray]:
     model.eval()
-    all_labels = []
-    all_probs = []
+    labels = []
+    probs = []
+
+    for batch in loader:
+        batch = move_batch_to_device(batch, device)
+        outputs = model(batch)
+        probs.extend(torch.sigmoid(outputs["fused_logit"]).cpu().numpy().tolist())
+        labels.extend(batch["labels"].cpu().numpy().tolist())
+
+    return np.array(labels), np.array(probs)
+
+
+@torch.no_grad()
+def evaluate(
+    model,
+    loader,
+    device: str | torch.device,
+    criterion=None,
+    threshold: float = 0.5,
+) -> tuple[dict, np.ndarray, np.ndarray]:
+    model.eval()
+    labels = []
+    probs = []
     losses = []
 
     for batch in loader:
-        if device is not None:
-            batch = {
-                k: v.to(device) if torch.is_tensor(v) else v
-                for k, v in batch.items()
-            }
-
+        batch = move_batch_to_device(batch, device)
         outputs = model(batch)
-        probs = torch.sigmoid(outputs["fused_logit"]).cpu().numpy()
-        labels = batch["labels"].cpu().numpy()
-
-        all_probs.extend(probs.tolist())
-        all_labels.extend(labels.tolist())
+        probs.extend(torch.sigmoid(outputs["fused_logit"]).cpu().numpy().tolist())
+        labels.extend(batch["labels"].cpu().numpy().tolist())
 
         if criterion is not None:
-            loss, _, _ = criterion(outputs, batch["labels"])
+            loss = criterion(outputs, batch["labels"])
+            if isinstance(loss, tuple):
+                loss = loss[0]
             losses.append(loss.item())
 
-    metrics = compute_metrics(np.array(all_labels), np.array(all_probs), threshold=threshold)
+    labels = np.array(labels)
+    probs = np.array(probs)
+    metrics = compute_metrics(labels, probs, threshold=threshold)
     metrics["loss"] = float(np.mean(losses)) if losses else 0.0
-    return metrics, np.array(all_labels), np.array(all_probs)
-
-
-@torch.no_grad()
-def evaluate_model(model, loader, device: str | torch.device = "cuda", threshold: float = 0.5):
-    model.eval()
-    all_labels = []
-    all_probs = []
-    total_loss = 0.0
-    total_n = 0
-
-    criterion = nn.BCEWithLogitsLoss()
-
-    for batch in loader:
-        batch = {
-            k: v.to(device) if torch.is_tensor(v) else v
-            for k, v in batch.items()
-        }
-
-        labels = batch["labels"].float()
-        outputs = model(batch)
-
-        loss = compute_loss(outputs, labels, criterion, br_w=0.5, mu=1.5)
-        probs = torch.sigmoid(outputs["fuse_logit"])
-
-        batch_size = labels.size(0)
-        total_loss += loss.item() * batch_size
-        total_n += batch_size
-
-        all_labels.extend(labels.cpu().numpy().tolist())
-        all_probs.extend(probs.cpu().numpy().tolist())
-
-    all_labels = np.array(all_labels)
-    all_probs = np.array(all_probs)
-    metrics = compute_metrics(all_labels, all_probs, threshold=threshold)
-    metrics["loss"] = total_loss / max(total_n, 1)
-    return metrics
+    return metrics, labels, probs
