@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import copy
-import os
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 from .loss import CombinedBCELoss, compute_loss
-from .metrics import evaluate, evaluate_model, search_best_threshold
+from .metrics import evaluate, search_best_threshold
 from .model import ModalityAblationModel, PoolingComparisonModel
+from .utils import move_batch_to_device
+
+
+@dataclass
+class TrainResult:
+    model: nn.Module
+    best_state: dict
+    test_at_half: dict
+    test_at_best_threshold: dict | None = None
 
 
 def compute_pos_weight(train_samples: list[dict]) -> float:
@@ -24,32 +34,95 @@ def train_one_epoch(
     loader,
     optimizer,
     criterion,
-    device: str | torch.device = "cuda",
-    br_w: float = 0.5,
-    mu: float = 1.5,
+    device: str | torch.device,
 ) -> float:
     model.train()
-    total_loss = 0.0
-    total_n = 0
+    losses = []
 
     for batch in loader:
-        batch = {
-            k: v.to(device) if torch.is_tensor(v) else v
-            for k, v in batch.items()
-        }
-        labels = batch["labels"].float()
-
+        batch = move_batch_to_device(batch, device)
         optimizer.zero_grad()
-        outputs = model(batch)
-        loss = compute_loss(outputs, labels, criterion, br_w=br_w, mu=mu)
+        loss = criterion(model(batch), batch["labels"])
+        if isinstance(loss, tuple):
+            loss = loss[0]
         loss.backward()
         optimizer.step()
+        losses.append(loss.item())
 
-        batch_size = labels.size(0)
-        total_loss += loss.item() * batch_size
-        total_n += batch_size
+    return float(np.mean(losses)) if losses else 0.0
 
-    return total_loss / max(total_n, 1)
+
+def fit_with_validation(
+    model,
+    train_loader,
+    valid_loader,
+    optimizer,
+    criterion,
+    device: str | torch.device,
+    epochs: int = 30,
+    patience: int = 8,
+    threshold_search: bool = True,
+    scheduler=None,
+    label: str = "model",
+):
+    best_score = -1.0
+    best_threshold = 0.5
+    best_state = None
+    patience_count = 0
+
+    for epoch in range(1, epochs + 1):
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        _, val_labels, val_probs = evaluate(
+            model,
+            valid_loader,
+            device=device,
+            criterion=criterion,
+            threshold=0.5,
+        )
+
+        if threshold_search:
+            current_threshold, val_metrics = search_best_threshold(val_labels, val_probs)
+        else:
+            current_threshold = 0.5
+            val_metrics, _, _ = evaluate(
+                model,
+                valid_loader,
+                device=device,
+                criterion=criterion,
+                threshold=0.5,
+            )
+
+        if scheduler is not None:
+            scheduler.step(val_metrics["f1"])
+
+        print(
+            f"[{label}] epoch {epoch:02d} | "
+            f"train_loss={train_loss:.4f} | "
+            f"val_f1={val_metrics['f1']:.4f} | "
+            f"val_auc={val_metrics['auc']:.4f}"
+        )
+
+        if val_metrics["f1"] > best_score:
+            best_score = val_metrics["f1"]
+            best_threshold = current_threshold
+            best_state = {
+                "model": copy.deepcopy(model.state_dict()),
+                "epoch": epoch,
+                "best_val_f1": best_score,
+                "best_threshold": best_threshold,
+            }
+            patience_count = 0
+        else:
+            patience_count += 1
+            if patience_count >= patience:
+                print(f"[{label}] early stopping at epoch {epoch}")
+                break
+
+    if best_state is None:
+        raise RuntimeError("Training finished without a valid best state.")
+
+    model.load_state_dict(best_state["model"])
+    return best_state
 
 
 def run_pooling_experiment(
@@ -60,11 +133,12 @@ def run_pooling_experiment(
     pos_weight: float,
     device: str | torch.device,
     epochs: int = 30,
+    patience: int = 8,
     topk: int = 3,
     tau: float = 0.5,
     save_dir: str | None = None,
-):
-    print(f"\n===== Running pooling: {pooling_type} =====")
+) -> TrainResult:
+    print(f"\n===== Pooling: {pooling_type} =====")
 
     model = PoolingComparisonModel(
         d_model=768,
@@ -74,15 +148,14 @@ def run_pooling_experiment(
         tau=tau,
         topk=topk,
     ).to(device)
-
     criterion = CombinedBCELoss(
-        lambda_br=0.5,
-        mu=1.5,
+        branch_weight=0.5,
+        fused_weight=1.5,
         pos_weight=pos_weight,
         label_smooth=0.01,
+        branch_reduction="sum",
         device=device,
     )
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -91,178 +164,93 @@ def run_pooling_experiment(
         patience=3,
     )
 
-    best_val_f1 = -1
-    best_state = None
-    best_thr = 0.5
-    patience = 8
-    patience_count = 0
-    save_path = None
+    best_state = fit_with_validation(
+        model,
+        train_loader,
+        valid_loader,
+        optimizer,
+        criterion,
+        device,
+        epochs=epochs,
+        patience=patience,
+        threshold_search=True,
+        scheduler=scheduler,
+        label=pooling_type,
+    )
+    best_state.update({"pooling_type": pooling_type, "tau": tau})
 
     if save_dir is not None:
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f"{pooling_type}_tau{tau}_best.pt")
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        save_path = Path(save_dir) / f"{pooling_type}_tau{tau}_best.pt"
+        torch.save(best_state, save_path)
+        print(f"Saved best model to: {save_path}")
 
-    for epoch in range(1, epochs + 1):
-        model.train()
-        train_losses = []
-
-        for batch in train_loader:
-            batch = {
-                k: v.to(device) if torch.is_tensor(v) else v
-                for k, v in batch.items()
-            }
-            optimizer.zero_grad()
-            outputs = model(batch)
-            loss, _, _ = criterion(outputs, batch["labels"])
-            loss.backward()
-            optimizer.step()
-            train_losses.append(loss.item())
-
-        _, val_labels, val_probs = evaluate(
-            model,
-            valid_loader,
-            criterion=criterion,
-            threshold=0.5,
-            device=device,
-        )
-        cur_thr, cur_best_metrics = search_best_threshold(val_labels, val_probs, metric="f1")
-        scheduler.step(cur_best_metrics["f1"])
-
-        print(
-            f"[{pooling_type}] Epoch {epoch:02d} | "
-            f"train_loss={np.mean(train_losses):.4f} | "
-            f"val_f1={cur_best_metrics['f1']:.4f} | "
-            f"val_auc={cur_best_metrics['auc']:.4f}"
-        )
-
-        if cur_best_metrics["f1"] > best_val_f1:
-            best_val_f1 = cur_best_metrics["f1"]
-            best_thr = cur_thr
-            best_state = {
-                "model": copy.deepcopy(model.state_dict()),
-                "epoch": epoch,
-                "best_val_f1": best_val_f1,
-                "best_thr": best_thr,
-                "pooling_type": pooling_type,
-                "tau": tau,
-            }
-            patience_count = 0
-
-            if save_path is not None:
-                torch.save(best_state, save_path)
-                print(f"Saved best model to: {save_path}")
-        else:
-            patience_count += 1
-            if patience_count >= patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
-
-    model.load_state_dict(best_state["model"])
-    test_metrics_05, _, _ = evaluate(
+    test_at_half, _, _ = evaluate(model, test_loader, device=device, criterion=criterion, threshold=0.5)
+    test_at_best, _, _ = evaluate(
         model,
         test_loader,
-        criterion=criterion,
-        threshold=0.5,
         device=device,
-    )
-    test_metrics_best, _, _ = evaluate(
-        model,
-        test_loader,
         criterion=criterion,
-        threshold=best_state["best_thr"],
-        device=device,
+        threshold=best_state["best_threshold"],
     )
 
     print(f"\n[{pooling_type}] Test @ 0.50")
-    print(test_metrics_05)
+    print(test_at_half)
     print(f"\n[{pooling_type}] Test @ Best Threshold from Valid")
-    print(test_metrics_best)
+    print(test_at_best)
 
-    return model, best_state, test_metrics_05, test_metrics_best
-
-
-ABLATION_CONFIGS = {
-    "TS": ["ts"],
-    "ThK": ["thk"],
-    "TK": ["tk"],
-    "ThS": ["ths"],
-    "TS+ThS": ["ts", "ths"],
-    "TK+ThK": ["tk", "thk"],
-    "TS+TK": ["ts", "tk"],
-    "ThS+ThK": ["ths", "thk"],
-    "w/o TS": ["tk", "thk", "ths"],
-    "w/o TK": ["ts", "thk", "ths"],
-    "w/o ThS": ["ts", "tk", "thk"],
-    "w/o ThK": ["ts", "tk", "ths"],
-    "All": ["tk", "ts", "thk", "ths"],
-}
+    return TrainResult(model, best_state, test_at_half, test_at_best)
 
 
 def run_ablation_experiment(
+    name: str,
+    active_branches: list[str],
     train_loader,
     valid_loader,
     test_loader,
     device: str | torch.device,
     epochs: int = 30,
     patience: int = 8,
-) -> dict:
-    results = {}
+) -> TrainResult:
+    print(f"\n===== Ablation: {name} =====")
 
-    for exp_name, branches in ABLATION_CONFIGS.items():
-        print(f"\n===== {exp_name} =====")
+    model = ModalityAblationModel(
+        d_model=768,
+        hidden_dim=64,
+        dropout=0.4,
+        pooling_type="attention",
+        tau=0.5,
+        topk=3,
+        active_branches=active_branches,
+    ).to(device)
+    bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([1.0], device=device))
 
-        model = ModalityAblationModel(
-            d_model=768,
-            hidden_dim=64,
-            dropout=0.4,
-            pooling_type="attention",
-            tau=0.5,
-            topk=3,
-            active_branches=branches,
-        ).to(device)
+    def criterion(outputs, labels):
+        return compute_loss(
+            outputs,
+            labels.float(),
+            bce,
+            branch_weight=0.5,
+            fused_weight=1.5,
+        )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
 
-        criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([1.0], device=device))
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
+    best_state = fit_with_validation(
+        model,
+        train_loader,
+        valid_loader,
+        optimizer,
+        criterion,
+        device,
+        epochs=epochs,
+        patience=patience,
+        threshold_search=False,
+        label=name,
+    )
+    best_state.update({"experiment": name, "active_branches": active_branches})
 
-        best_val_f1 = -1
-        best_state = None
-        patience_counter = 0
+    test_at_half, _, _ = evaluate(model, test_loader, device=device, criterion=criterion, threshold=0.5)
+    print(f"\n[{name}] Test @ 0.50")
+    print(test_at_half)
 
-        for epoch in range(epochs):
-            train_loss = train_one_epoch(
-                model,
-                train_loader,
-                optimizer,
-                criterion,
-                device=device,
-                br_w=0.5,
-                mu=1.5,
-            )
-            val_metrics = evaluate_model(model, valid_loader, device=device, threshold=0.5)
-
-            print(
-                f"[{exp_name}] epoch {epoch + 1:02d} | "
-                f"train_loss={train_loss:.4f} | "
-                f"val_f1={val_metrics['f1']:.4f} | "
-                f"val_auc={val_metrics['auc']:.4f}"
-            )
-
-            if val_metrics["f1"] > best_val_f1:
-                best_val_f1 = val_metrics["f1"]
-                best_state = copy.deepcopy(model.state_dict())
-                patience_counter = 0
-            else:
-                patience_counter += 1
-
-            if patience_counter >= patience:
-                print(f"[{exp_name}] Early stopping at epoch {epoch + 1}")
-                break
-
-        model.load_state_dict(best_state)
-        test_metrics = evaluate_model(model, test_loader, device=device, threshold=0.5)
-        results[exp_name] = test_metrics
-
-        print(f"\n[{exp_name}] Test @ 0.50")
-        print(test_metrics)
-
-    return results
+    return TrainResult(model, best_state, test_at_half)

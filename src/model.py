@@ -7,27 +7,11 @@ import torch.nn.functional as F
 from .pooling import AttentionPooling, MeanPooling, TopKPooling, TopKSimPooling
 
 
-def pair_features(h1: torch.Tensor, h2: torch.Tensor) -> torch.Tensor:
-    return torch.cat([h1, h2, torch.abs(h1 - h2), h1 * h2], dim=-1)
+BRANCH_ORDER = ("tk", "ts", "thk", "ths")
 
 
-class BranchMLP(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int = 64, dropout: float = 0.4):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-        self.logit = nn.Linear(hidden_dim, 1)
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        z = self.net(x)
-        return z, self.logit(z).squeeze(-1)
+def pair_features(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    return torch.cat([left, right, torch.abs(left - right), left * right], dim=-1)
 
 
 def build_pooling(pooling_type: str, tau: float = 0.5, topk: int = 3) -> nn.Module:
@@ -42,7 +26,29 @@ def build_pooling(pooling_type: str, tau: float = 0.5, topk: int = 3) -> nn.Modu
     raise ValueError(f"Unknown pooling_type: {pooling_type}")
 
 
-class PoolingComparisonModel(nn.Module):
+class BranchMLP(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int = 64, dropout: float = 0.4):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.classifier = nn.Linear(hidden_dim, 1)
+
+    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden = self.encoder(features)
+        logit = self.classifier(hidden).squeeze(-1)
+        return hidden, logit
+
+
+class BranchFusionModel(nn.Module):
+    """Shared model for pooling comparison and modality ablation experiments."""
+
     def __init__(
         self,
         d_model: int = 768,
@@ -51,103 +57,40 @@ class PoolingComparisonModel(nn.Module):
         pooling_type: str = "attention",
         tau: float = 0.5,
         topk: int = 3,
+        active_branches: list[str] | tuple[str, ...] | None = None,
+        normalize_pairs: bool = False,
+        branch_tau: float = 1.5,
     ):
         super().__init__()
-        self.d_model = d_model
-        self.pair_dim = 4 * d_model
         self.pooling_type = pooling_type
+        self.active_branches = tuple(active_branches or BRANCH_ORDER)
+        self.branch_tau = branch_tau
         self.pool = build_pooling(pooling_type, tau=tau, topk=topk)
 
-        self.branch_tk = BranchMLP(self.pair_dim, hidden_dim, dropout)
-        self.branch_ts = BranchMLP(self.pair_dim, hidden_dim, dropout)
-        self.branch_thk = BranchMLP(self.pair_dim, hidden_dim, dropout)
-        self.branch_ths = BranchMLP(self.pair_dim, hidden_dim, dropout)
+        unknown = set(self.active_branches) - set(BRANCH_ORDER)
+        if unknown:
+            raise ValueError(f"Unknown branches: {sorted(unknown)}")
 
-        self.att_w = nn.Linear(hidden_dim, 1)
+        pair_dim = 4 * d_model
+        self.pair_norm = nn.LayerNorm(pair_dim) if normalize_pairs else nn.Identity()
+        self.branches = nn.ModuleDict({
+            name: BranchMLP(pair_dim, hidden_dim, dropout)
+            for name in BRANCH_ORDER
+        })
+        self.branch_attention = nn.Linear(hidden_dim, 1)
         self.fuse_out = nn.Linear(hidden_dim, 1)
-        self.branch_tau = 1.5
 
-    def _pool_for_query(self, seq: torch.Tensor, mask: torch.Tensor, query: torch.Tensor):
-        if self.pooling_type in ["mean", "topk"]:
-            return self.pool(seq, mask, None)
-        return self.pool(seq, mask, query)
-
-    def forward(self, batch: dict) -> dict:
-        title = batch["title_emb"]
-        thumb = batch["thumb_emb"]
-        stt_seq = batch["stt_embs"]
-        stt_mask = batch["stt_mask"]
-        key_seq = batch["kf_embs"]
-        key_mask = batch["kf_mask"]
-
-        stt_by_title, attn_s_t = self._pool_for_query(stt_seq, stt_mask, title)
-        key_by_title, attn_k_t = self._pool_for_query(key_seq, key_mask, title)
-        stt_by_thumb, attn_s_th = self._pool_for_query(stt_seq, stt_mask, thumb)
-        key_by_thumb, attn_k_th = self._pool_for_query(key_seq, key_mask, thumb)
-
-        z_tk, s_tk = self.branch_tk(pair_features(title, key_by_title))
-        z_ts, s_ts = self.branch_ts(pair_features(title, stt_by_title))
-        z_thk, s_thk = self.branch_thk(pair_features(thumb, key_by_thumb))
-        z_ths, s_ths = self.branch_ths(pair_features(thumb, stt_by_thumb))
-
-        stacked = torch.stack([z_tk, z_ts, z_thk, z_ths], dim=1)
-        att_scores = self.att_w(stacked).squeeze(-1)
-        alpha = F.softmax(att_scores / self.branch_tau, dim=1)
-        z_fuse = torch.sum(alpha.unsqueeze(-1) * stacked, dim=1)
-        fused_logit = self.fuse_out(z_fuse).squeeze(-1)
-
-        return {
-            "branch_logits": {
-                "tk": s_tk,
-                "ts": s_ts,
-                "thk": s_thk,
-                "ths": s_ths,
-            },
-            "fused_logit": fused_logit,
-            "fuse_logit": fused_logit,
-            "branch_attention": alpha,
-            "alpha": alpha,
-            "token_attention": {
-                "s_t": attn_s_t,
-                "k_t": attn_k_t,
-                "s_th": attn_s_th,
-                "k_th": attn_k_th,
-            },
-        }
-
-
-class ModalityAblationModel(nn.Module):
-    def __init__(
+    def _pool_sequence(
         self,
-        d_model: int = 768,
-        hidden_dim: int = 64,
-        dropout: float = 0.4,
-        pooling_type: str = "attention",
-        tau: float = 0.5,
-        topk: int = 3,
-        active_branches: list[str] | None = None,
-    ):
-        super().__init__()
-        self.pair_dim = 4 * d_model
-        self.pooling_type = pooling_type
-        self.pool = build_pooling(pooling_type, tau=tau, topk=topk)
-        self.active_branches = active_branches or ["tk", "ts", "thk", "ths"]
+        seq_embs: torch.Tensor,
+        seq_mask: torch.Tensor,
+        query: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.pooling_type in {"mean", "topk"}:
+            return self.pool(seq_embs, seq_mask, None)
+        return self.pool(seq_embs, seq_mask, query)
 
-        self.branch_tk = BranchMLP(self.pair_dim, hidden_dim, dropout)
-        self.branch_ts = BranchMLP(self.pair_dim, hidden_dim, dropout)
-        self.branch_thk = BranchMLP(self.pair_dim, hidden_dim, dropout)
-        self.branch_ths = BranchMLP(self.pair_dim, hidden_dim, dropout)
-
-        self.pair_ln = nn.LayerNorm(self.pair_dim)
-        self.att_w = nn.Linear(hidden_dim, 1)
-        self.fuse_out = nn.Linear(hidden_dim, 1)
-
-    def _pool_for_query(self, seq: torch.Tensor, mask: torch.Tensor, query: torch.Tensor):
-        if self.pooling_type in ["mean", "topk"]:
-            return self.pool(seq, mask, None)[0]
-        return self.pool(seq, mask, query)[0]
-
-    def encode_pairs(self, batch: dict) -> dict:
+    def encode_pairs(self, batch: dict) -> dict[str, torch.Tensor]:
         title = batch["title_emb"]
         thumb = batch["thumb_emb"]
         stt_seq = batch["stt_embs"]
@@ -155,46 +98,65 @@ class ModalityAblationModel(nn.Module):
         key_seq = batch["kf_embs"]
         key_mask = batch["kf_mask"]
 
-        stt_by_title = self._pool_for_query(stt_seq, stt_mask, title)
-        stt_by_thumb = self._pool_for_query(stt_seq, stt_mask, thumb)
-        key_by_title = self._pool_for_query(key_seq, key_mask, title)
-        key_by_thumb = self._pool_for_query(key_seq, key_mask, thumb)
+        stt_by_title, attn_s_t = self._pool_sequence(stt_seq, stt_mask, title)
+        key_by_title, attn_k_t = self._pool_sequence(key_seq, key_mask, title)
+        stt_by_thumb, attn_s_th = self._pool_sequence(stt_seq, stt_mask, thumb)
+        key_by_thumb, attn_k_th = self._pool_sequence(key_seq, key_mask, thumb)
 
-        return {
-            "tk": self.pair_ln(pair_features(title, key_by_title)),
-            "ts": self.pair_ln(pair_features(title, stt_by_title)),
-            "thk": self.pair_ln(pair_features(thumb, key_by_thumb)),
-            "ths": self.pair_ln(pair_features(thumb, stt_by_thumb)),
+        pairs = {
+            "tk": pair_features(title, key_by_title),
+            "ts": pair_features(title, stt_by_title),
+            "thk": pair_features(thumb, key_by_thumb),
+            "ths": pair_features(thumb, stt_by_thumb),
         }
+        pairs = {name: self.pair_norm(features) for name, features in pairs.items()}
+        token_attention = {
+            "s_t": attn_s_t,
+            "k_t": attn_k_t,
+            "s_th": attn_s_th,
+            "k_th": attn_k_th,
+        }
+        return pairs, token_attention
 
     def forward(self, batch: dict) -> dict:
-        pairs = self.encode_pairs(batch)
-        branch_layers = {
-            "tk": self.branch_tk,
-            "ts": self.branch_ts,
-            "thk": self.branch_thk,
-            "ths": self.branch_ths,
-        }
+        pairs, token_attention = self.encode_pairs(batch)
 
-        branch_outputs = {}
-        used_h = []
+        branch_logits = {}
+        hidden_states = []
         for name in self.active_branches:
-            h, logit = branch_layers[name](pairs[name])
-            branch_outputs[name] = logit
-            used_h.append(h)
+            hidden, logit = self.branches[name](pairs[name])
+            branch_logits[name] = logit
+            hidden_states.append(hidden)
 
-        if not used_h:
-            raise ValueError("No active branches selected.")
+        if not hidden_states:
+            raise ValueError("At least one active branch is required.")
 
-        hidden = torch.stack(used_h, dim=1)
-        alpha = torch.softmax(self.att_w(hidden).squeeze(-1), dim=1)
-        fused = (hidden * alpha.unsqueeze(-1)).sum(dim=1)
-        fused_logit = self.fuse_out(fused).squeeze(-1)
+        hidden_stack = torch.stack(hidden_states, dim=1)
+        scores = self.branch_attention(hidden_stack).squeeze(-1)
+        alpha = F.softmax(scores / self.branch_tau, dim=1)
+        fused_hidden = (hidden_stack * alpha.unsqueeze(-1)).sum(dim=1)
+        fused_logit = self.fuse_out(fused_hidden).squeeze(-1)
 
         return {
-            "branch_logits": branch_outputs,
+            "branch_logits": branch_logits,
             "fused_logit": fused_logit,
             "fuse_logit": fused_logit,
             "branch_attention": alpha,
             "alpha": alpha,
+            "branch_names": self.active_branches,
+            "token_attention": token_attention,
         }
+
+
+class PoolingComparisonModel(BranchFusionModel):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("active_branches", BRANCH_ORDER)
+        kwargs.setdefault("normalize_pairs", False)
+        super().__init__(*args, **kwargs)
+
+
+class ModalityAblationModel(BranchFusionModel):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("pooling_type", "attention")
+        kwargs.setdefault("normalize_pairs", True)
+        super().__init__(*args, **kwargs)
