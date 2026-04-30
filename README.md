@@ -4,17 +4,13 @@ This repository contains a clickbait detection experiment based on precomputed
 multimodal embeddings for title text, thumbnail image, speech-to-text segments,
 and keyframe features.
 
-The original end-to-end notebook is kept in
-`notebooks/clickbait_detection.ipynb`. The reusable code has been split into
-Python modules under `src/` and executable experiment entrypoints under
-`experiments/`.
+The code is organized into reusable Python modules under `src/` and executable
+experiment entrypoints under `experiments/`.
 
 ## Structure
 
 ```text
 clickbait-detection/
-├── notebooks/
-│   └── clickbait_detection.ipynb
 ├── src/
 │   ├── __init__.py
 │   ├── data.py
